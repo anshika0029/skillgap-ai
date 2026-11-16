@@ -22,7 +22,10 @@ from prompts import SYSTEM_PROMPT, build_user_prompt
 BASE_DIR = Path(__file__).parent
 DATA_FILE = Path(os.getenv("SKILLGAP_DATA", BASE_DIR / "jobs_clean.csv"))
 STORE_FILE = BASE_DIR / "user_data.json"
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Models are tried in this order; the first one that works is used.
+# (Google retires and renames models often. Set GEMINI_MODEL to force one.)
+GEMINI_MODELS = [m for m in [os.getenv("GEMINI_MODEL"), "gemini-3.8-flash", "gemini-3.6-flash",
+                             "gemini-3.5-flash-lite", "gemini-2.5-flash"] if m]
 
 EXPERIENCE_ORDER = ["Intern/Fresher", "Entry", "Mid", "Senior"]
 
@@ -394,7 +397,7 @@ def _clean_plan(raw: dict, fallback: dict, hpw: float) -> dict:
 
 
 def generate_ai_plan(profile: dict, analysis: dict, api_key: str) -> dict:
-    """Call Gemini with the prompt from prompts.py. Raises on failure (UI shows the message)."""
+    """Call Gemini with the prompt from prompts.py. Raises RuntimeError with details on failure."""
     from google import genai
     from google.genai import types
 
@@ -402,18 +405,29 @@ def generate_ai_plan(profile: dict, analysis: dict, api_key: str) -> dict:
     fallback = rule_based_plan(profile, analysis)
     prompt = build_user_prompt(profile, analysis, gap_table(analysis, hpw))
     client = genai.Client(api_key=api_key)
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            temperature=0.4,
-        ),
-    )
-    text = (resp.text or "").strip()
-    text = re.sub(r"^```(?:json)?|```$", "", text).strip()
-    return _clean_plan(json.loads(text), fallback, hpw)
+    errors = []
+    for model in GEMINI_MODELS:
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                ),
+            )
+            text = (resp.text or "").strip()
+            text = re.sub(r"^```(?:json)?|```$", "", text).strip()
+            plan = _clean_plan(json.loads(text), fallback, hpw)
+            plan["model"] = model
+            return plan
+        except Exception as ex:
+            msg = f"{model}: {type(ex).__name__}: {str(ex)[:180]}"
+            errors.append(msg)
+            low = str(ex).lower()
+            if "api key not valid" in low or "api_key_invalid" in low:
+                break  # a wrong key will fail for every model
+    raise RuntimeError(" | ".join(errors))
 
 
 # ----------------------------------------------------------------------
@@ -454,8 +468,11 @@ def check_pin(pin: str, stored: str) -> bool:
 
 
 def _sb_headers(extra=None):
-    h = {"apikey": _CFG["key"], "Authorization": f"Bearer {_CFG['key']}",
-         "Content-Type": "application/json"}
+    # Legacy keys (service_role) are JWTs and go in both headers.
+    # New keys (sb_secret_...) are not JWTs and must be sent in "apikey" only.
+    h = {"apikey": _CFG["key"], "Content-Type": "application/json"}
+    if _CFG["key"].startswith("eyJ"):
+        h["Authorization"] = f"Bearer {_CFG['key']}"
     h.update(extra or {})
     return h
 
