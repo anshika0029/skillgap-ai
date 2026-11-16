@@ -1,0 +1,4 @@
+user_data.json
+.streamlit/secrets.toml
+__pycache__/
+*.tmp
